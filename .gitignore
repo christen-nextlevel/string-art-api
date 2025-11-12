@@ -1,0 +1,25 @@
+# Python venv & caches
+.venv/
+__pycache__/
+*.pyc
+
+# Build artifacts
+*.log
+*.tmp
+*.DS_Store
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Generated media/output
+**/frames/
+**/*.png
+**/*.mp4
+**/*.gif
+**/*.pdf
+**/*.csv
+**/*.txt
+
+# Local env / secrets
+.env
+*.env
