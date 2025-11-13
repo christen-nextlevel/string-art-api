@@ -1,439 +1,437 @@
 import os
-import io
+import json
 import uuid
-import shutil
-import hashlib
-import threading
-from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Optional, Literal
+
+import numpy as np
+import matplotlib.pyplot as plt
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+from starlette.responses import FileResponse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")  # headless
-import matplotlib.pyplot as plt
+from skimage import io, color, draw
+import imageio.v2 as imageio
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-from skimage import io as skio, color, draw
-
-# Optional video
-try:
-    import imageio.v2 as imageio
-    HAVE_IMAGEIO = True
-except Exception:
-    HAVE_IMAGEIO = False
-
-# PDF export
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+    PageBreak,
+)
+from reportlab.lib.styles import getSampleStyleSheet
 
-# --------------------------------------------------------------------------------------
-# Config / Paths
-# --------------------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Basic config
+# -------------------------------------------------------------------
 
-app = FastAPI(title="String Art API")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. https://string-art-api.onrender.com
+JOBS_ROOT = "jobs"
+os.makedirs(JOBS_ROOT, exist_ok=True)
 
-FILES_ROOT = Path(os.getenv("FILES_ROOT", "jobs"))  # where we keep generated artifacts
-FILES_ROOT.mkdir(parents=True, exist_ok=True)
-
-# Serve files:  https://<BASE>/files/<jobId>/<file>
-app.mount("/files", StaticFiles(directory=str(FILES_ROOT)), name="files")
-
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # set on Render (e.g., https://string-art-api.onrender.com)
-
-# In-memory job store (MVP/testing). For production, use a DB/redis.
-_JOBS: Dict[str, Dict[str, Any]] = {}
-
-# --------------------------------------------------------------------------------------
-# Models
-# --------------------------------------------------------------------------------------
-
-class RedeemPayload(BaseModel):
-    imageUrl: str
-    settings: Optional[Dict[str, Any]] = None
-    # you can include "code" or other fields here if you want, they are ignored by the API for now
-    code: Optional[str] = None
+# Parameters for the string art generator
+NUM_NAILS = 240
+NUM_LINES = 1300
+LIGHTEN_TO = 1.0
+SNAPSHOT_EVERY = 25  # how often to snapshot for timelapse
 
 
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
+app = FastAPI(title="String Art API", version="1.0.0")
 
-def _job_dir(job_id: str) -> Path:
-    d = FILES_ROOT / job_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def _public_url(job_id: str, filename: str) -> str:
-    rel = f"/files/{job_id}/{filename}"
+# A tiny thread pool so jobs run in the background
+EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+
+# -------------------------------------------------------------------
+# Pydantic models
+# -------------------------------------------------------------------
+
+class RedeemBody(BaseModel):
+    imageUrl: HttpUrl
+
+
+class JobStatus(BaseModel):
+    jobId: str
+    status: Literal["queued", "processing", "done", "error"]
+    error: Optional[str] = None
+    resultImageUrl: Optional[str] = None
+    resultPdfUrl: Optional[str] = None
+    resultCsvUrl: Optional[str] = None
+    resultTimelapseUrl: Optional[str] = None
+
+
+# -------------------------------------------------------------------
+# Helper functions for status JSON per job
+# -------------------------------------------------------------------
+
+def job_dir(job_id: str) -> str:
+    return os.path.join(JOBS_ROOT, job_id)
+
+
+def status_path(job_id: str) -> str:
+    return os.path.join(job_dir(job_id), "status.json")
+
+
+def read_status(job_id: str) -> JobStatus:
+    path = status_path(job_id)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return JobStatus(**data)
+
+
+def write_status(status: JobStatus) -> None:
+    jd = job_dir(status.jobId)
+    os.makedirs(jd, exist_ok=True)
+    path = status_path(status.jobId)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(status.dict(), f)
+
+
+def build_file_url(job_id: str, filename: str) -> str:
     if PUBLIC_BASE_URL:
-        return f"{PUBLIC_BASE_URL}{rel}"
-    return rel  # relative (works for curl/local)
+        base = PUBLIC_BASE_URL.rstrip("/")
+        return f"{base}/files/{job_id}/{filename}"
+    # Fallback: relative path
+    return f"/files/{job_id}/{filename}"
 
-def _download_to(url: str, dest_path: Path):
-    r = requests.get(url, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Failed to download image: HTTP {r.status_code}")
-    dest_path.write_bytes(r.content)
 
-def _save_frame(canvas: np.ndarray, out_path: Path, dpi: int = 200):
-    plt.figure(figsize=(8, 8))
-    plt.imshow(canvas, cmap="gray", vmin=0, vmax=1)
-    plt.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out_path, dpi=dpi, bbox_inches="tight", pad_inches=0)
-    plt.close()
+# -------------------------------------------------------------------
+# Core pipeline: string art + timelapse + CSV → PDF
+# -------------------------------------------------------------------
 
-def _csv_to_pdf(csv_path: Path, pdf_path: Path, title="String Art Threading Instructions",
-                subtitle="Nail 1 is at the top (12 o'clock), numbers increase clockwise.",
-                landscape_mode: bool = False):
+def generate_string_art_assets(input_path: str, job_id: str) -> None:
     """
-    Minimal no-pandas CSV->PDF table (compatible with your script’s output).
+    Runs the full pipeline for a given job:
+    - generate string art PNG
+    - generate frames + MP4 timelapse
+    - generate CSV & PDF instructions
+    Updates status.json as it goes.
     """
-    import csv
-    page_size = landscape(A4) if landscape_mode else A4
+    jd = job_dir(job_id)
+    os.makedirs(jd, exist_ok=True)
+
+    status = JobStatus(jobId=job_id, status="processing")
+    write_status(status)
+
+    try:
+        # ---------------------
+        # Load & prepare image
+        # ---------------------
+        img = io.imread(input_path)
+
+        if img.ndim == 3:
+            if img.shape[2] == 4:  # RGBA
+                img = color.rgba2rgb(img.astype(np.float32) / 255.0)
+            if img.max() > 1.0:
+                img = img / 255.0
+            img = color.rgb2gray(img)
+        else:
+            img = img.astype(np.float32)
+            if img.max() > 1.0:
+                img /= 255.0
+
+        h, w = img.shape
+        r = min(h // 2, w // 2)
+        img = img[0:2 * r, 0:2 * r]
+        L = img.shape[0]
+
+        # Nails on a circle
+        angles = np.linspace(0, 2 * np.pi, NUM_NAILS, endpoint=False)
+        rows = (L / 2 + (L * 0.5) * np.cos(angles)).astype(int)
+        cols = (L / 2 + (L * 0.5) * np.sin(angles)).astype(int)
+        nails = list(zip(rows, cols))  # (row, col)
+
+        canvas = np.ones_like(img)  # white canvas
+
+        # For instructions
+        lines = []  # (from, to) pairs, 1-indexed
+
+        # For timelapse
+        frames_dir = os.path.join(jd, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+
+        def save_frame(frame_idx: int):
+            fname = os.path.join(frames_dir, f"frame_{frame_idx:05d}.png")
+            plt.figure(figsize=(6, 6))
+            plt.imshow(canvas, cmap="gray", vmin=0, vmax=1)
+            plt.axis("off")
+            plt.tight_layout(pad=0)
+            plt.savefig(fname, dpi=150, bbox_inches="tight", pad_inches=0)
+            plt.close()
+
+        current = 0
+        save_frame(0)  # initial blank
+
+        for i in range(NUM_LINES):
+            best_j = current
+            best_avg = np.inf
+            best_rr = best_cc = None
+
+            cr, cc = nails[current]
+            for j in range(NUM_NAILS):
+                rr, cc2 = draw.line(cr, cc, nails[j][0], nails[j][1])
+                rr = np.clip(rr, 0, L - 1)
+                cc2 = np.clip(cc2, 0, L - 1)
+                avg = float(np.mean(img[rr, cc2]))
+                if avg < best_avg:
+                    best_avg = avg
+                    best_j = j
+                    best_rr, best_cc = rr, cc2
+
+            if best_rr is not None:
+                img[best_rr, best_cc] = LIGHTEN_TO
+                canvas[best_rr, best_cc] = 0.0  # draw black line
+
+            # record line (1-indexed)
+            lines.append((current + 1, best_j + 1))
+            current = best_j
+
+            if SNAPSHOT_EVERY and ((i + 1) % SNAPSHOT_EVERY == 0):
+                save_frame(i + 1)
+
+        # ---------------------
+        # Save final PNG
+        # ---------------------
+        result_png = os.path.join(jd, "string_art_result.png")
+        plt.figure(figsize=(8, 8))
+        plt.imshow(canvas, cmap="gray", vmin=0, vmax=1)
+        plt.axis("off")
+        plt.tight_layout(pad=0)
+        plt.savefig(result_png, dpi=300, bbox_inches="tight", pad_inches=0)
+        plt.close()
+
+        # ---------------------
+        # Save CSV instructions
+        # ---------------------
+        csv_path = os.path.join(jd, "string_art_lines.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("from_nail,to_nail\n")
+            for a, b in lines:
+                f.write(f"{a},{b}\n")
+
+        # ---------------------
+        # Make PDF from CSV
+        # ---------------------
+        pdf_path = os.path.join(jd, "string_art_instructions.pdf")
+        build_pdf_from_csv(csv_path, pdf_path)
+
+        # ---------------------
+        # Make MP4 timelapse
+        # ---------------------
+        mp4_path = os.path.join(jd, "string_art_timelapse.mp4")
+        make_mp4_from_frames(frames_dir, mp4_path)
+
+        # Done
+        status.status = "done"
+        status.resultImageUrl = build_file_url(job_id, "string_art_result.png")
+        status.resultPdfUrl = build_file_url(job_id, "string_art_instructions.pdf")
+        status.resultCsvUrl = build_file_url(job_id, "string_art_lines.csv")
+        status.resultTimelapseUrl = build_file_url(job_id, "string_art_timelapse.mp4")
+        write_status(status)
+
+    except Exception as e:
+        status.status = "error"
+        status.error = str(e)
+        write_status(status)
+
+
+def build_pdf_from_csv(csv_path: str, pdf_path: str) -> None:
+    rows = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        header = f.readline()  # skip header
+        for i, line in enumerate(f, start=1):
+            parts = line.strip().split(",")
+            if len(parts) != 2:
+                continue
+            from_nail, to_nail = parts
+            rows.append([i, from_nail, to_nail])
+
+    styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=page_size,
+        pdf_path,
+        pagesize=A4,
         leftMargin=15 * mm,
         rightMargin=15 * mm,
         topMargin=18 * mm,
         bottomMargin=18 * mm,
     )
+
     story = []
-    story.append(Paragraph(f"<b>{title}</b>", _pdf_styles()["Title"]))
+    story.append(Paragraph("<b>String Art Threading Instructions</b>", styles["Title"]))
     story.append(Spacer(1, 6))
-    story.append(Paragraph(subtitle, _pdf_styles()["Normal"]))
+    story.append(
+        Paragraph(
+            "Nail 1 is at the top (12 o'clock). Numbers increase clockwise.",
+            styles["Normal"],
+        )
+    )
     story.append(Spacer(1, 10))
 
     header = ["Step", "From Nail", "To Nail"]
-    rows = []
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        # tolerate header variants
-        fn = None
-        tn = None
-        if reader.fieldnames:
-            fns = {k.lower().strip(): k for k in reader.fieldnames}
-            fn = fns.get("from_nail") or fns.get("from") or reader.fieldnames[0]
-            tn = fns.get("to_nail") or fns.get("to") or reader.fieldnames[1]
-        for i, row in enumerate(reader, start=1):
-            rows.append([i, str(row[fn]).strip(), str(row[tn]).strip()])
+    data = [header] + rows
+    col_widths = [25 * mm, 45 * mm, 45 * mm]
 
-    table = Table([header] + rows, colWidths=[25 * mm, 45 * mm, 45 * mm])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.black),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("FONTSIZE", (0, 0), (-1, 0), 11),
-        ("FONTSIZE", (0, 1), (-1, -1), 9),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-    ]))
+    table = Table(data, colWidths=col_widths)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.black),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTSIZE", (0, 0), (-1, 0), 11),
+                ("FONTSIZE", (0, 1), (-1, -1), 9),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                 [colors.whitesmoke, colors.lightgrey]),
+            ]
+        )
+    )
     story.append(table)
     doc.build(story)
 
-_pdf_style_cache = None
-def _pdf_styles():
-    from reportlab.lib.styles import getSampleStyleSheet
-    global _pdf_style_cache
-    if _pdf_style_cache is None:
-        _pdf_style_cache = getSampleStyleSheet()
-    return _pdf_style_cache
 
+def make_mp4_from_frames(frames_dir: str, mp4_path: str, fps: int = 30) -> None:
+    frames = sorted(
+        [
+            os.path.join(frames_dir, f)
+            for f in os.listdir(frames_dir)
+            if f.lower().endswith(".png")
+        ]
+    )
+    if not frames:
+        return
 
-# --------------------------------------------------------------------------------------
-# Core String Art Routine (single pass does image + csv + frames)
-# --------------------------------------------------------------------------------------
-
-def run_string_art_with_frames(
-    input_image_path: Path,
-    out_dir: Path,
-    num_nails: int = 240,
-    num_lines: int = 1300,
-    lighten_to: float = 1.0,
-    snapshot_every: int = 25,
-    make_gif: bool = False,
-    gif_fps: int = 20,
-    make_mp4: bool = True,
-    mp4_fps: int = 30,
-) -> Dict[str, Any]:
-    """
-    Returns dict with keys:
-      result_png, lines_csv, instr_txt, frames_dir, timelapse_gif (opt), timelapse_mp4 (opt)
-    """
-    # --- load & grayscale (RGB/RGBA/gray) ---
-    img = skio.imread(str(input_image_path))
-    if img.ndim == 3:
-        if img.shape[2] == 4:
-            img = color.rgba2rgb(img.astype(np.float32) / 255.0)
-        if img.max() > 1.0:
-            img = img / 255.0
-        img = color.rgb2gray(img)
-    else:
-        img = img.astype(np.float32)
-        if img.max() > 1.0:
-            img /= 255.0
-
-    # --- square crop (top-left) ---
-    h, w = img.shape
-    r = min(h // 2, w // 2)
-    img = img[0:2 * r, 0:2 * r]
-    L = img.shape[0]
-
-    # --- nails on circle ---
-    angles = np.linspace(0, 2 * np.pi, num_nails, endpoint=False)
-    rows = (L / 2 + (L * 0.5) * np.cos(angles)).astype(int)
-    cols = (L / 2 + (L * 0.5) * np.sin(angles)).astype(int)
-    nails = list(zip(rows, cols))  # (row, col)
-
-    # --- canvas (white) ---
-    canvas = np.ones_like(img)
-
-    # outputs
-    result_png = out_dir / "string_art_result.png"
-    lines_csv = out_dir / "string_art_lines.csv"
-    instr_txt = out_dir / "string_art_instructions.txt"
-    frames_dir = out_dir / "frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    # save initial blank frame
-    if snapshot_every and snapshot_every > 0:
-        _save_frame(canvas, frames_dir / f"frame_{0:05d}.png")
-
-    # drawing loop
-    current = 0
-    order = [current + 1]
-    lines = []
-
-    for i in range(num_lines):
-        best_j = current
-        best_avg = np.inf
-        best_rr = best_cc = None
-
-        cr, cc = nails[current]
-        for j in range(num_nails):
-            rr, cc2 = draw.line(cr, cc, nails[j][0], nails[j][1])
-            rr = np.clip(rr, 0, L - 1)
-            cc2 = np.clip(cc2, 0, L - 1)
-            avg = float(np.mean(img[rr, cc2]))  # 0=dark, 1=light
-            if avg < best_avg:
-                best_avg = avg
-                best_j = j
-                best_rr, best_cc = rr, cc2
-
-        if best_rr is not None:
-            img[best_rr, best_cc] = lighten_to
-            canvas[best_rr, best_cc] = 0.0
-
-        lines.append((current + 1, best_j + 1))
-        current = best_j
-        order.append(current + 1)
-
-        if snapshot_every and ((i + 1) % snapshot_every == 0):
-            _save_frame(canvas, frames_dir / f"frame_{(i + 1):05d}.png")
-
-    # final still image
-    _save_frame(canvas, result_png, dpi=300)
-
-    # write CSV
-    with lines_csv.open("w", encoding="utf-8") as f:
-        f.write("from_nail,to_nail\n")
-        for a, b in lines:
-            f.write(f"{a},{b}\n")
-
-    # write one-line instructions
-    with instr_txt.open("w", encoding="utf-8") as f:
-        f.write("STRING ART THREAD ORDER (1-indexed, nail 1 at the top by convention):\n")
-        for i in range(0, len(order), 25):
-            f.write(" ".join(str(x) for x in order[i:i+25]) + "\n")
-
-    # build GIF/MP4 from frames
-    timelapse_gif = None
-    timelapse_mp4 = None
-
-    frame_files = sorted([p for p in frames_dir.glob("frame_*.png")])
-    if HAVE_IMAGEIO and frame_files:
-        if make_gif:
-            imgs = [imageio.imread(str(p)) for p in frame_files]
-            timelapse_gif = out_dir / "string_art_timelapse.gif"
-            imageio.mimsave(str(timelapse_gif), imgs, fps=gif_fps)
-        if make_mp4:
-            try:
-                import imageio_ffmpeg  # noqa: F401
-                timelapse_mp4 = out_dir / "string_art_timelapse.mp4"
-                writer = imageio.get_writer(
-                    str(timelapse_mp4),
-                    format="FFMPEG",
-                    fps=mp4_fps,
-                    codec="libx264",
-                    quality=8,
-                )
-                for p in frame_files:
-                    im = imageio.imread(str(p))
-                    if im.ndim == 2:
-                        im = np.stack([im, im, im], axis=-1)
-                    if im.dtype != np.uint8:
-                        im = np.clip(im, 0, 255).astype(np.uint8)
-                    writer.append_data(im)
-                writer.close()
-            except Exception as e:
-                # MP4 optional; ignore if ffmpeg not present on the platform
-                print(f"[WARN] MP4 export failed: {e}")
-
-    return {
-        "result_png": str(result_png),
-        "lines_csv": str(lines_csv),
-        "instr_txt": str(instr_txt),
-        "frames_dir": str(frames_dir),
-        "timelapse_gif": str(timelapse_gif) if timelapse_gif else None,
-        "timelapse_mp4": str(timelapse_mp4) if timelapse_mp4 else None,
-    }
-
-
-# --------------------------------------------------------------------------------------
-# Job runner
-# --------------------------------------------------------------------------------------
-
-def _process_job(job_id: str, image_path: Path, settings: Dict[str, Any]):
-    job = _JOBS[job_id]
-    out_dir = _job_dir(job_id)
-
-    # defaults (keep small for free tier testing)
-    num_nails = int(settings.get("numNails", 240))
-    num_lines = int(settings.get("numLines", 900))
-    lighten_to = float(settings.get("lightenTo", 1.0))
-    snapshot_every = int(settings.get("snapshotEvery", 25))
-    make_gif = bool(settings.get("makeGif", False))
-    make_mp4 = bool(settings.get("makeMp4", True))
-
+    writer = imageio.get_writer(mp4_path, fps=fps)
     try:
-        job["status"] = "processing"
-        job["progress"] = 5
-
-        # run the combined routine
-        sa = run_string_art_with_frames(
-            input_image_path=image_path,
-            out_dir=out_dir,
-            num_nails=num_nails,
-            num_lines=num_lines,
-            lighten_to=lighten_to,
-            snapshot_every=snapshot_every,
-            make_gif=make_gif,
-            make_mp4=make_mp4,
-        )
-        job["progress"] = 80
-
-        # build PDF from CSV
-        csv_path = Path(sa["lines_csv"])
-        pdf_path = out_dir / "string_art_instructions.pdf"
-        _csv_to_pdf(csv_path, pdf_path)
-        job["progress"] = 90
-
-        # publish URLs
-        job["resultImageUrl"] = _public_url(job_id, Path(sa["result_png"]).name)
-        job["resultCsvUrl"] = _public_url(job_id, csv_path.name)
-        job["resultPdfUrl"] = _public_url(job_id, pdf_path.name)
-
-        # prefer MP4 if available, else GIF, else final PNG
-        if sa.get("timelapse_mp4"):
-            job["resultTimelapseUrl"] = _public_url(job_id, Path(sa["timelapse_mp4"]).name)
-        elif sa.get("timelapse_gif"):
-            job["resultTimelapseUrl"] = _public_url(job_id, Path(sa["timelapse_gif"]).name)
-        else:
-            job["resultTimelapseUrl"] = job["resultImageUrl"]
-
-        job["status"] = "done"
-        job["progress"] = 100
-
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-        job["progress"] = 100
-        print(f"[ERROR] Job {job_id} failed: {e}")
+        for f in frames:
+            im = imageio.imread(f)
+            if im.ndim == 2:
+                im = np.stack([im, im, im], axis=-1)
+            if im.dtype != np.uint8:
+                im = np.clip(im * 255, 0, 255).astype(np.uint8)
+            writer.append_data(im)
+    finally:
+        writer.close()
 
 
-# --------------------------------------------------------------------------------------
-# API Routes
-# --------------------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# API endpoints
+# -------------------------------------------------------------------
 
 @app.get("/")
-def home():
-    return {"status": "ok", "publicBaseUrl": PUBLIC_BASE_URL or "(relative)", "filesRoot": str(FILES_ROOT)}
-
-@app.get("/status/{job_id}")
-def status(job_id: str):
-    job = _JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Unknown job")
-    # don’t dump local paths to clients
-    public = {k: v for k, v in job.items() if not k.endswith("_path")}
-    return public
-
-@app.post("/redeem")
-def redeem(payload: RedeemPayload):
-    """
-    Starts a background job using an image URL (Wix upload URL is perfect).
-    Returns a jobId you can poll with /status/{jobId}.
-    """
-    if not payload.imageUrl:
-        raise HTTPException(status_code=400, detail="imageUrl required")
-
-    # seed job
-    job_id = uuid.uuid4().hex[:12]
-    _JOBS[job_id] = {
-        "status": "queued",
-        "progress": 0,
-        "resultImageUrl": None,
-        "resultPdfUrl": None,
-        "resultCsvUrl": None,
-        "resultTimelapseUrl": None,
+def root():
+    return {
+        "status": "ok",
+        "publicBaseUrl": PUBLIC_BASE_URL or "(relative)",
+        "filesRoot": JOBS_ROOT,
     }
 
-    # download image
-    out_dir = _job_dir(job_id)
-    input_path = out_dir / "input.jpg"
+
+@app.post("/redeem", response_model=JobStatus)
+def redeem(body: RedeemBody):
+    """
+    Start a job from an image URL.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    jd = job_dir(job_id)
+    os.makedirs(jd, exist_ok=True)
+
+    # Download image
+    input_path = os.path.join(jd, "input.jpg")
     try:
-        _download_to(payload.imageUrl, input_path)
+        resp = requests.get(str(body.imageUrl), timeout=30)
+        if resp.status_code != 200:
+            status = JobStatus(
+                jobId=job_id,
+                status="error",
+                error=f"Failed to download image: HTTP {resp.status_code}",
+            )
+            write_status(status)
+            return status
+        with open(input_path, "wb") as f:
+            f.write(resp.content)
     except Exception as e:
-        _JOBS[job_id]["status"] = "error"
-        _JOBS[job_id]["error"] = f"Download failed: {e}"
-        return {"jobId": job_id, "status": "error", "error": str(e)}
+        status = JobStatus(jobId=job_id, status="error", error=str(e))
+        write_status(status)
+        return status
 
-    settings = payload.settings or {}
+    # Initial status
+    status = JobStatus(jobId=job_id, status="queued")
+    write_status(status)
 
-    # spawn background thread
-    t = threading.Thread(target=_process_job, args=(job_id, input_path, settings), daemon=True)
-    t.start()
+    # Kick off background processing
+    EXECUTOR.submit(generate_string_art_assets, input_path, job_id)
 
-    return {"jobId": job_id, "status": "queued"}
+    return status
 
-@app.post("/redeem-upload")
-def redeem_upload(file: UploadFile = File(...)):
+
+@app.post("/redeem-upload", response_model=JobStatus)
+async def redeem_upload(file: UploadFile = File(...)):
     """
-    Alternative: send a file directly (multipart/form-data). Handy for local tests.
+    Start a job from an uploaded image.
     """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
+
     job_id = uuid.uuid4().hex[:12]
-    _JOBS[job_id] = {
-        "status": "queued",
-        "progress": 0,
-        "resultImageUrl": None,
-        "resultPdfUrl": None,
-        "resultCsvUrl": None,
-        "resultTimelapseUrl": None,
-    }
+    jd = job_dir(job_id)
+    os.makedirs(jd, exist_ok=True)
 
-    out_dir = _job_dir(job_id)
-    input_path = out_dir / "input.jpg"
-    input_path.write_bytes(file.file.read())
+    input_path = os.path.join(jd, "input.jpg")
+    try:
+        contents = await file.read()
+        with open(input_path, "wb") as out:
+            out.write(contents)
+    except Exception as e:
+        status = JobStatus(jobId=job_id, status="error", error=f"Failed to save upload: {e}")
+        write_status(status)
+        return status
 
-    settings = {}
-    t = threading.Thread(target=_process_job, args=(job_id, input_path, settings), daemon=True)
-    t.start()
-    return {"jobId": job_id, "status": "queued"}
+    status = JobStatus(jobId=job_id, status="queued")
+    write_status(status)
+
+    EXECUTOR.submit(generate_string_art_assets, input_path, job_id)
+
+    return status
+
+
+@app.get("/status/{job_id}", response_model=JobStatus)
+def get_status(job_id: str):
+    status = read_status(job_id)
+
+    # If already done, ensure URLs are absolute
+    if status.status == "done":
+        if status.resultImageUrl is None:
+            status.resultImageUrl = build_file_url(job_id, "string_art_result.png")
+        if status.resultPdfUrl is None:
+            status.resultPdfUrl = build_file_url(job_id, "string_art_instructions.pdf")
+        if status.resultCsvUrl is None:
+            status.resultCsvUrl = build_file_url(job_id, "string_art_lines.csv")
+        if status.resultTimelapseUrl is None:
+            status.resultTimelapseUrl = build_file_url(job_id, "string_art_timelapse.mp4")
+
+    return status
+
+
+@app.get("/files/{job_id}/{filename}")
+def get_file(job_id: str, filename: str):
+    path = os.path.join(job_dir(job_id), filename)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)
