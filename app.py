@@ -343,43 +343,46 @@ def root():
     }
 
 
-@app.post("/redeem", response_model=JobStatus)
-def redeem(body: RedeemBody):
+@app.post("/redeem-upload", response_model=JobStatus)
+async def redeem_upload(file: UploadFile = File(...)):
     """
-    Start a job from an image URL.
+    Start a job from an uploaded image.
+    Always writes a status.json file so /status/{job_id} never 404s.
     """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
+
+    # 1) Create job folder and input path
     job_id = uuid.uuid4().hex[:12]
     jd = job_dir(job_id)
     os.makedirs(jd, exist_ok=True)
 
-    # Download image
     input_path = os.path.join(jd, "input.jpg")
-    try:
-        resp = requests.get(str(body.imageUrl), timeout=30)
-        if resp.status_code != 200:
-            status = JobStatus(
-                jobId=job_id,
-                status="error",
-                error=f"Failed to download image: HTTP {resp.status_code}",
-            )
-            write_status(status)
-            return status
-        with open(input_path, "wb") as f:
-            f.write(resp.content)
-    except Exception as e:
-        status = JobStatus(jobId=job_id, status="error", error=str(e))
-        write_status(status)
-        return status
 
-    # Initial status
+    # 2) Save the uploaded file
+    try:
+        contents = await file.read()
+        with open(input_path, "wb") as out:
+            out.write(contents)
+    except Exception as e:
+        # If saving fails, still create a status.json with error
+        error_status = JobStatus(
+            jobId=job_id,
+            status="error",
+            error=f"Failed to save upload: {e}",
+        )
+        write_status(error_status)
+        return error_status
+
+    # 3) Write initial queued status synchronously
     status = JobStatus(jobId=job_id, status="queued")
     write_status(status)
 
-    # Kick off background processing
+    # 4) Kick off background processing
     EXECUTOR.submit(generate_string_art_assets, input_path, job_id)
 
+    # 5) Return the queued status to the caller
     return status
-
 
 @app.post("/redeem-upload", response_model=JobStatus)
 async def redeem_upload(file: UploadFile = File(...)):
