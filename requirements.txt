@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+numpy
+scikit-image
+matplotlib
+imageio
+imageio-ffmpeg
+reportlab
+requests
+python-multipart
