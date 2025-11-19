@@ -46,9 +46,9 @@ os.makedirs(JOBS_ROOT, exist_ok=True)
 
 # Parameters for the string art generator
 NUM_NAILS = 240
-NUM_LINES = 1300
+NUM_LINES = 100 #1300
 LIGHTEN_TO = 1.0
-SNAPSHOT_EVERY = 25  # how often to snapshot for timelapse
+SNAPSHOT_EVERY = 20 #25  # how often to snapshot for timelapse
 
 
 app = FastAPI(title="String Art API", version="1.0.0")
