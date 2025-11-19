@@ -137,6 +137,9 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
     status = JobStatus(jobId=job_id, status="processing")
     write_status(status)
 
+    # 👇 DEBUG: log that the job started
+    print(f"[JOB {job_id}] Starting pipeline, input_path={input_path}", flush=True)
+
     try:
         # ---------------------
         # Load & prepare image
@@ -253,19 +256,17 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
         status.resultTimelapseUrl = build_file_url(job_id, "string_art_timelapse.mp4")
         write_status(status)
 
-    except Exception as e:
-        # Log full stack trace to Render logs
-        err_text = traceback.format_exc()
-        print(f"[WORKER] ERROR in job {job_id}:\n{err_text}")
+        # 👇 DEBUG: log success
+        print(f"[JOB {job_id}] Finished OK", flush=True)
 
-        # Update the job status so /status/{job_id} shows the failure
+    except Exception as e:
         status.status = "error"
         status.error = str(e)
-        status.resultImageUrl = None
-        status.resultPdfUrl = None
-        status.resultCsvUrl = None
-        status.resultTimelapseUrl = None
         write_status(status)
+
+        # 👇 DEBUG: log the error and stack trace to Render logs
+        print(f"[JOB {job_id}] ERROR: {e!r}", flush=True)
+        traceback.print_exc()
 
 
 def build_pdf_from_csv(csv_path: str, pdf_path: str) -> None:
