@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 from typing import Optional, Literal
+import traceback
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -253,8 +254,17 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
         write_status(status)
 
     except Exception as e:
+        # Log full stack trace to Render logs
+        err_text = traceback.format_exc()
+        print(f"[WORKER] ERROR in job {job_id}:\n{err_text}")
+
+        # Update the job status so /status/{job_id} shows the failure
         status.status = "error"
         status.error = str(e)
+        status.resultImageUrl = None
+        status.resultPdfUrl = None
+        status.resultCsvUrl = None
+        status.resultTimelapseUrl = None
         write_status(status)
 
 
