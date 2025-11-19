@@ -27,7 +27,14 @@ from reportlab.platypus import (
     PageBreak,
 )
 from reportlab.lib.styles import getSampleStyleSheet
+# =====================================================
+# Ensure persistent jobs directory
+# =====================================================
+from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent
+JOBS_DIR = BASE_DIR / "jobs"
+JOBS_DIR.mkdir(exist_ok=True)
 # -------------------------------------------------------------------
 # Basic config
 # -------------------------------------------------------------------
