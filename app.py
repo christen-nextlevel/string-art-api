@@ -137,13 +137,13 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
     status = JobStatus(jobId=job_id, status="processing")
     write_status(status)
 
-    # 👇 DEBUG: log that the job started
     print(f"[JOB {job_id}] Starting pipeline, input_path={input_path}", flush=True)
 
     try:
         # ---------------------
         # Load & prepare image
         # ---------------------
+        print(f"[JOB {job_id}] Loading image...", flush=True)
         img = io.imread(input_path)
 
         if img.ndim == 3:
@@ -161,6 +161,8 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
         r = min(h // 2, w // 2)
         img = img[0:2 * r, 0:2 * r]
         L = img.shape[0]
+
+        print(f"[JOB {job_id}] Image prepared, size={L}x{L}", flush=True)
 
         # Nails on a circle
         angles = np.linspace(0, 2 * np.pi, NUM_NAILS, endpoint=False)
@@ -188,6 +190,7 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
 
         current = 0
         save_frame(0)  # initial blank
+        print(f"[JOB {job_id}] Starting line loop, NUM_LINES={NUM_LINES}", flush=True)
 
         for i in range(NUM_LINES):
             best_j = current
@@ -215,6 +218,11 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
 
             if SNAPSHOT_EVERY and ((i + 1) % SNAPSHOT_EVERY == 0):
                 save_frame(i + 1)
+
+            if (i + 1) % 200 == 0:
+                print(f"[JOB {job_id}] Completed {i+1} / {NUM_LINES} lines", flush=True)
+
+        print(f"[JOB {job_id}] Line loop done, saving outputs...", flush=True)
 
         # ---------------------
         # Save final PNG
@@ -256,16 +264,14 @@ def generate_string_art_assets(input_path: str, job_id: str) -> None:
         status.resultTimelapseUrl = build_file_url(job_id, "string_art_timelapse.mp4")
         write_status(status)
 
-        # 👇 DEBUG: log success
-        print(f"[JOB {job_id}] Finished OK", flush=True)
+        print(f"[JOB {job_id}] Pipeline finished successfully", flush=True)
 
     except Exception as e:
+        import traceback
         status.status = "error"
         status.error = str(e)
         write_status(status)
-
-        # 👇 DEBUG: log the error and stack trace to Render logs
-        print(f"[JOB {job_id}] ERROR: {e!r}", flush=True)
+        print(f"[JOB {job_id}] ERROR: {e}", flush=True)
         traceback.print_exc()
 
 
